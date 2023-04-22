@@ -124,10 +124,11 @@ ssize_t  Curl_cf_def_recv(struct Curl_cfilter *cf, struct Curl_easy *data,
 }
 
 bool Curl_cf_def_conn_is_alive(struct Curl_cfilter *cf,
-                               struct Curl_easy *data)
+                               struct Curl_easy *data,
+                               bool *input_pending)
 {
   return cf->next?
-    cf->next->cft->is_alive(cf->next, data) :
+    cf->next->cft->is_alive(cf->next, data, input_pending) :
     FALSE; /* pessimistic in absence of data */
 }
 
@@ -282,21 +283,31 @@ void Curl_conn_cf_insert_after(struct Curl_cfilter *cf_at,
   *pnext = tail;
 }
 
-void Curl_conn_cf_discard(struct Curl_cfilter *cf, struct Curl_easy *data)
+bool Curl_conn_cf_discard_sub(struct Curl_cfilter *cf,
+                              struct Curl_cfilter *discard,
+                              struct Curl_easy *data,
+                              bool destroy_always)
 {
-  struct Curl_cfilter **pprev = &cf->conn->cfilter[cf->sockindex];
+  struct Curl_cfilter **pprev = &cf->next;
+  bool found = FALSE;
 
-  /* remove from chain if still in there */
+  /* remove from sub-chain and destroy */
   DEBUGASSERT(cf);
   while (*pprev) {
     if (*pprev == cf) {
-      *pprev = cf->next;
+      *pprev = discard->next;
+      discard->next = NULL;
+      found = TRUE;
       break;
     }
     pprev = &((*pprev)->next);
   }
-  cf->cft->destroy(cf, data);
-  free(cf);
+  if(found || destroy_always) {
+    discard->next = NULL;
+    discard->cft->destroy(discard, data);
+    free(discard);
+  }
+  return found;
 }
 
 CURLcode Curl_conn_cf_connect(struct Curl_cfilter *cf,
@@ -370,8 +381,11 @@ CURLcode Curl_conn_connect(struct Curl_easy *data,
     result = cf->cft->connect(cf, data, blocking, done);
     if(!result && *done) {
       Curl_conn_ev_update_info(data, data->conn);
-      Curl_conn_ev_report_stats(data, data->conn);
+      Curl_conn_report_connect_stats(data, data->conn);
       data->conn->keepalive = Curl_now();
+    }
+    else if(result) {
+      Curl_conn_report_connect_stats(data, data->conn);
     }
   }
 
@@ -401,10 +415,8 @@ bool Curl_conn_is_ip_connected(struct Curl_easy *data, int sockindex)
   return FALSE;
 }
 
-bool Curl_conn_is_ssl(struct connectdata *conn, int sockindex)
+bool Curl_conn_cf_is_ssl(struct Curl_cfilter *cf)
 {
-  struct Curl_cfilter *cf = conn? conn->cfilter[sockindex] : NULL;
-
   for(; cf; cf = cf->next) {
     if(cf->cft->flags & CF_TYPE_SSL)
       return TRUE;
@@ -412,6 +424,11 @@ bool Curl_conn_is_ssl(struct connectdata *conn, int sockindex)
       return FALSE;
   }
   return FALSE;
+}
+
+bool Curl_conn_is_ssl(struct connectdata *conn, int sockindex)
+{
+  return conn? Curl_conn_cf_is_ssl(conn->cfilter[sockindex]) : FALSE;
 }
 
 bool Curl_conn_is_multiplex(struct connectdata *conn, int sockindex)
@@ -608,16 +625,32 @@ void Curl_conn_ev_update_info(struct Curl_easy *data,
   cf_cntrl_all(conn, data, TRUE, CF_CTRL_CONN_INFO_UPDATE, 0, NULL);
 }
 
-void Curl_conn_ev_report_stats(struct Curl_easy *data,
-                               struct connectdata *conn)
-{
-  cf_cntrl_all(conn, data, TRUE, CF_CTRL_CONN_REPORT_STATS, 0, NULL);
-}
-
-bool Curl_conn_is_alive(struct Curl_easy *data, struct connectdata *conn)
+void Curl_conn_report_connect_stats(struct Curl_easy *data,
+                                    struct connectdata *conn)
 {
   struct Curl_cfilter *cf = conn->cfilter[FIRSTSOCKET];
-  return cf && !cf->conn->bits.close && cf->cft->is_alive(cf, data);
+  if(cf) {
+    struct curltime connected;
+    struct curltime appconnected;
+
+    memset(&connected, 0, sizeof(connected));
+    cf->cft->query(cf, data, CF_QUERY_TIMER_CONNECT, NULL, &connected);
+    if(connected.tv_sec || connected.tv_usec)
+      Curl_pgrsTimeWas(data, TIMER_CONNECT, connected);
+
+    memset(&appconnected, 0, sizeof(appconnected));
+    cf->cft->query(cf, data, CF_QUERY_TIMER_APPCONNECT, NULL, &appconnected);
+    if(appconnected.tv_sec || appconnected.tv_usec)
+      Curl_pgrsTimeWas(data, TIMER_APPCONNECT, appconnected);
+  }
+}
+
+bool Curl_conn_is_alive(struct Curl_easy *data, struct connectdata *conn,
+                        bool *input_pending)
+{
+  struct Curl_cfilter *cf = conn->cfilter[FIRSTSOCKET];
+  return cf && !cf->conn->bits.close &&
+         cf->cft->is_alive(cf, data, input_pending);
 }
 
 CURLcode Curl_conn_keep_alive(struct Curl_easy *data,

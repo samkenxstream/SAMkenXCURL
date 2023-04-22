@@ -11,11 +11,31 @@ on:
     - '*/ci'
     paths-ignore:
     - '**/*.md'
+    - '**/CMakeLists.txt'
+    - '.azure-pipelines.yml'
+    - '.circleci/**'
+    - '.cirrus.yml'
+    - 'appveyor.yml'
+    - 'CMake/**'
+    - 'packages/**'
+    - 'plan9/**'
+    - 'projects/**'
+    - 'winbuild/**'
   pull_request:
     branches:
     - master
     paths-ignore:
     - '**/*.md'
+    - '**/CMakeLists.txt'
+    - '.azure-pipelines.yml'
+    - '.circleci/**'
+    - '.cirrus.yml'
+    - 'appveyor.yml'
+    - 'CMake/**'
+    - 'packages/**'
+    - 'plan9/**'
+    - 'projects/**'
+    - 'winbuild/**'
 
 concurrency:
   # Hardcoded workflow filename as workflow name above is just Linux again
@@ -43,18 +63,18 @@ jobs:
           ngtcp2-configure: >-
             --prefix=$HOME/all PKG_CONFIG_PATH="$HOME/all/lib/pkgconfig" --enable-lib-only
           wolfssl-configure: >-
-            --enable-quic --enable-session-ticket --enable-earlydata --enable-psk
-            --enable-harden --enable-altcertchains
+            --enable-all --enable-quic
 
     steps:
     - run: |
         sudo apt-get update
         sudo apt-get install libtool autoconf automake pkg-config stunnel4 ${{ matrix.build.install }}
-        sudo python3 -m pip install impacket
-      name: 'install prereqs and impacket'
+        sudo apt-get install apache2 apache2-dev
+        sudo python3 -m pip install impacket pytest cryptography multipart
+      name: 'install prereqs and impacket, pytest, crypto'
 
     - run: |
-        git clone https://github.com/wolfSSL/wolfssl.git
+        git clone --quiet --depth=1 https://github.com/wolfSSL/wolfssl.git
         cd wolfssl
         ./autogen.sh
         ./configure ${{ matrix.build.wolfssl-configure }} --prefix=$HOME/all
@@ -62,14 +82,14 @@ jobs:
       name: 'install wolfssl'
 
     - run: |
-        git clone --depth=1 -b openssl-3.0.7+quic https://github.com/quictls/openssl
+        git clone --quiet --depth=1 -b openssl-3.0.8+quic https://github.com/quictls/openssl
         cd openssl
         ./config --prefix=$HOME/all --libdir=$HOME/all/lib
         make install_sw
       name: 'install quictls'
 
     - run: |
-        git clone --depth=1 -b v0.8.0 https://github.com/ngtcp2/nghttp3
+        git clone --quiet --depth=1 -b v0.10.0 https://github.com/ngtcp2/nghttp3
         cd nghttp3
         autoreconf -fi
         ./configure --prefix=$HOME/all PKG_CONFIG_PATH="$HOME/all/lib/pkgconfig" --enable-lib-only
@@ -77,7 +97,7 @@ jobs:
       name: 'install nghttp3'
 
     - run: |
-        git clone --depth=1 -b v0.12.1 https://github.com/ngtcp2/ngtcp2
+        git clone --quiet --depth=1 -b v0.13.1 https://github.com/ngtcp2/ngtcp2
         cd ngtcp2
         autoreconf -fi
         ./configure ${{ matrix.build.ngtcp2-configure }} --with-openssl  --with-wolfssl
@@ -85,12 +105,21 @@ jobs:
       name: 'install ngtcp2'
 
     - run: |
-        git clone --depth=1 -b v1.51.0 https://github.com/nghttp2/nghttp2
+        git clone --quiet --depth=1 -b v1.52.0 https://github.com/nghttp2/nghttp2
         cd nghttp2
         autoreconf -fi
         ./configure --prefix=$HOME/all PKG_CONFIG_PATH="$HOME/all/lib/pkgconfig" --enable-http3
         make install
       name: 'install nghttp2'
+
+    - run: |
+        git clone --quiet --depth=1 -b master https://github.com/icing/mod_h2
+        cd mod_h2
+        autoreconf -fi
+        ./configure PKG_CONFIG_PATH="$HOME/all/lib/pkgconfig"
+        make
+        sudo make install
+      name: 'install mod_h2'
 
     - uses: actions/checkout@v3
 
@@ -113,3 +142,10 @@ jobs:
       name: 'run tests'
       env:
         TFLAGS: "${{ matrix.build.tflags }}"
+
+    # Disabled for now, we see spurious SSL_connect() errors when talking
+    # http/1.1 to apache and this, so far, is not reproducable in local testing
+    #- run: pytest -v
+    #  name: 'run pytest'
+    #  env:
+    #    TFLAGS: "${{ matrix.build.tflags }}"

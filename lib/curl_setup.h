@@ -441,8 +441,8 @@
 #  endif
 #endif
 
-#if (SIZEOF_CURL_OFF_T == 4)
-#  define CURL_OFF_T_MAX CURL_OFF_T_C(0x7FFFFFFF)
+#if (SIZEOF_CURL_OFF_T < 8)
+#error "too small curl_off_t"
 #else
    /* assume SIZEOF_CURL_OFF_T == 8 */
 #  define CURL_OFF_T_MAX CURL_OFF_T_C(0x7FFFFFFFFFFFFFFF)
@@ -777,14 +777,16 @@ endings either CRLF or LF so 't' is appropriate.
 #define FOPEN_APPENDTEXT "a"
 #endif
 
-/* WinSock destroys recv() buffer when send() failed.
- * Enabled automatically for Windows and for Cygwin as Cygwin sockets are
- * wrappers for WinSock sockets. https://github.com/curl/curl/issues/657
- * Define DONT_USE_RECV_BEFORE_SEND_WORKAROUND to force disable workaround.
+/* Windows workaround to recv before every send, because apparently Winsock
+ * destroys destroys recv() buffer when send() failed.
+ * This workaround is now disabled by default since it caused hard to fix bugs.
+ * Define USE_RECV_BEFORE_SEND_WORKAROUND to enable it.
+ * https://github.com/curl/curl/issues/657
+ * https://github.com/curl/curl/pull/10409
  */
 #if !defined(DONT_USE_RECV_BEFORE_SEND_WORKAROUND)
 #  if defined(WIN32) || defined(__CYGWIN__)
-#    define USE_RECV_BEFORE_SEND_WORKAROUND
+/* #    define USE_RECV_BEFORE_SEND_WORKAROUND */
 #  endif
 #else  /* DONT_USE_RECV_BEFORE_SEND_WORKAROUND */
 #  ifdef USE_RECV_BEFORE_SEND_WORKAROUND
@@ -831,9 +833,17 @@ int getpwuid_r(uid_t uid, struct passwd *pwd, char *buf,
 #define USE_HTTP2
 #endif
 
-#if defined(USE_NGTCP2) || defined(USE_QUICHE) || defined(USE_MSH3)
+#if (defined(USE_NGTCP2) && defined(USE_NGHTTP3)) || \
+    defined(USE_QUICHE) || defined(USE_MSH3)
 #define ENABLE_QUIC
 #define USE_HTTP3
+#endif
+
+/* Certain Windows implementations are not aligned with what curl expects,
+   so always use the local one on this platform. E.g. the mingw-w64
+   implementation can return wrong results for non-ASCII inputs. */
+#if defined(HAVE_BASENAME) && defined(WIN32)
+#undef HAVE_BASENAME
 #endif
 
 #if defined(USE_UNIX_SOCKETS) && defined(WIN32)
@@ -851,6 +861,12 @@ int getpwuid_r(uid_t uid, struct passwd *pwd, char *buf,
      } SOCKADDR_UN, *PSOCKADDR_UN;
 #    define WIN32_SOCKADDR_UN
 #  endif
+#endif
+
+/* OpenSSLv3 marks DES, MD5 and ENGINE functions deprecated but we have no
+   replacements (yet) so tell the compiler to not warn for them. */
+#ifdef USE_OPENSSL
+#define OPENSSL_SUPPRESS_DEPRECATED
 #endif
 
 #endif /* HEADER_CURL_SETUP_H */

@@ -42,6 +42,10 @@
 
 #include "curl_printf.h"
 
+#ifdef WIN32
+#define sleep(sec) Sleep ((sec)*1000)
+#endif
+
 #define test_setopt(A,B,C)                                      \
   if((res = curl_easy_setopt((A), (B), (C))) != CURLE_OK)       \
     goto test_cleanup
@@ -69,9 +73,7 @@ extern int test(char *URL); /* the actual test function provided by each
 
 extern char *hexdump(const unsigned char *buffer, size_t len);
 
-#ifdef UNITTESTS
 extern int unitfail;
-#endif
 
 /*
 ** TEST_ERR_* values must be greater than CURL_LAST CURLcode in order

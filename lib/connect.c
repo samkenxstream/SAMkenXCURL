@@ -59,7 +59,8 @@
 #include "strerror.h"
 #include "cfilters.h"
 #include "connect.h"
-#include "cf-http.h"
+#include "cf-haproxy.h"
+#include "cf-https-connect.h"
 #include "cf-socket.h"
 #include "select.h"
 #include "url.h" /* for Curl_safefree() */
@@ -186,7 +187,7 @@ addr_first_match(const struct Curl_addrinfo *addr, int family)
 static const struct Curl_addrinfo *
 addr_next_match(const struct Curl_addrinfo *addr, int family)
 {
-  while(addr->ai_next) {
+  while(addr && addr->ai_next) {
     addr = addr->ai_next;
     if(addr->ai_family == family)
       return addr;
@@ -406,7 +407,8 @@ static CURLcode eyeballer_new(struct eyeballer **pballer,
   baller->ai_family = ai_family;
   baller->primary = primary;
   baller->delay_ms = delay_ms;
-  baller->timeoutms = (addr && addr->ai_next)? timeout_ms / 2 : timeout_ms;
+  baller->timeoutms = addr_next_match(baller->addr, baller->ai_family)?
+                        timeout_ms / 2 : timeout_ms;
   baller->timeout_id = timeout_id;
   baller->result = CURLE_COULDNT_CONNECT;
 
@@ -467,7 +469,7 @@ static void baller_initiate(struct Curl_cfilter *cf,
     wcf->sockindex = cf->sockindex;
   }
 
-  if(baller->addr && baller->addr->ai_next) {
+  if(addr_next_match(baller->addr, baller->ai_family)) {
     Curl_expire(data, baller->timeoutms, baller->timeout_id);
   }
 
@@ -498,8 +500,8 @@ static CURLcode baller_start(struct Curl_cfilter *cf,
 
   while(baller->addr) {
     baller->started = Curl_now();
-    baller->timeoutms = (baller->addr->ai_next == NULL) ?
-                         timeoutms : timeoutms / 2;
+    baller->timeoutms = addr_next_match(baller->addr, baller->ai_family) ?
+                         timeoutms / 2 : timeoutms;
     baller_initiate(cf, data, baller);
     if(!baller->result)
       break;
@@ -662,7 +664,9 @@ evaluate:
           DEBUGF(LOG_CF(data, cf, "%s done", baller->name));
         }
         else {
-          DEBUGF(LOG_CF(data, cf, "%s starting", baller->name));
+          DEBUGF(LOG_CF(data, cf, "%s starting (timeout=%"
+                        CURL_FORMAT_TIMEDIFF_T "ms)",
+                        baller->name, baller->timeoutms));
           ++ongoing;
           ++added;
         }
@@ -799,6 +803,9 @@ static CURLcode start_connect(struct Curl_cfilter *cf,
                           timeout_ms,  EXPIRE_DNS_PER_NAME);
   if(result)
     return result;
+  DEBUGF(LOG_CF(data, cf, "created %s (timeout %"
+                CURL_FORMAT_TIMEDIFF_T "ms)",
+                ctx->baller[0]->name, ctx->baller[0]->timeoutms));
   if(addr1) {
     /* second one gets a delayed start */
     result = eyeballer_new(&ctx->baller[1], ctx->cf_create, addr1, ai_family1,
@@ -808,6 +815,9 @@ static CURLcode start_connect(struct Curl_cfilter *cf,
                             timeout_ms,  EXPIRE_DNS_PER_NAME2);
     if(result)
       return result;
+    DEBUGF(LOG_CF(data, cf, "created %s (timeout %"
+                  CURL_FORMAT_TIMEDIFF_T "ms)",
+                  ctx->baller[1]->name, ctx->baller[1]->timeoutms));
   }
 
   Curl_expire(data, data->set.happy_eyeballs_timeout,
@@ -951,6 +961,28 @@ static bool cf_he_data_pending(struct Curl_cfilter *cf,
   return FALSE;
 }
 
+static struct curltime get_max_baller_time(struct Curl_cfilter *cf,
+                                          struct Curl_easy *data,
+                                          int query)
+{
+  struct cf_he_ctx *ctx = cf->ctx;
+  struct curltime t, tmax;
+  size_t i;
+
+  memset(&tmax, 0, sizeof(tmax));
+  for(i = 0; i < sizeof(ctx->baller)/sizeof(ctx->baller[0]); i++) {
+    struct eyeballer *baller = ctx->baller[i];
+
+    memset(&t, 0, sizeof(t));
+    if(baller && baller->cf &&
+       !baller->cf->cft->query(baller->cf, data, query, NULL, &t)) {
+      if((t.tv_sec || t.tv_usec) && Curl_timediff_us(t, tmax) > 0)
+        tmax = t;
+    }
+  }
+  return tmax;
+}
+
 static CURLcode cf_he_query(struct Curl_cfilter *cf,
                             struct Curl_easy *data,
                             int query, int *pres1, void *pres2)
@@ -978,7 +1010,16 @@ static CURLcode cf_he_query(struct Curl_cfilter *cf,
       DEBUGF(LOG_CF(data, cf, "query connect reply: %dms", *pres1));
       return CURLE_OK;
     }
-
+    case CF_QUERY_TIMER_CONNECT: {
+      struct curltime *when = pres2;
+      *when = get_max_baller_time(cf, data, CF_QUERY_TIMER_CONNECT);
+      return CURLE_OK;
+    }
+    case CF_QUERY_TIMER_APPCONNECT: {
+      struct curltime *when = pres2;
+      *when = get_max_baller_time(cf, data, CF_QUERY_TIMER_APPCONNECT);
+      return CURLE_OK;
+    }
     default:
       break;
     }
@@ -1182,7 +1223,7 @@ connect_sub_chain:
 
   if(ctx->state < CF_SETUP_CNNCT_HTTP_PROXY && cf->conn->bits.httpproxy) {
 #ifdef USE_SSL
-    if(cf->conn->http_proxy.proxytype == CURLPROXY_HTTPS
+    if(IS_HTTPS_PROXY(cf->conn->http_proxy.proxytype)
        && !Curl_conn_is_ssl(cf->conn, cf->sockindex)) {
       result = Curl_cf_ssl_proxy_insert_after(cf, data);
       if(result)
@@ -1368,9 +1409,8 @@ CURLcode Curl_conn_setup(struct Curl_easy *data,
 
 #if !defined(CURL_DISABLE_HTTP) && !defined(USE_HYPER)
   if(!conn->cfilter[sockindex] &&
-     conn->handler->protocol == CURLPROTO_HTTPS &&
-     (ssl_mode == CURL_CF_SSL_ENABLE || ssl_mode != CURL_CF_SSL_DISABLE)) {
-
+     conn->handler->protocol == CURLPROTO_HTTPS) {
+    DEBUGASSERT(ssl_mode != CURL_CF_SSL_DISABLE);
     result = Curl_cf_https_setup(data, conn, sockindex, remotehost);
     if(result)
       goto out;

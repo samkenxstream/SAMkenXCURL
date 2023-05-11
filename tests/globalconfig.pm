@@ -44,14 +44,13 @@ BEGIN {
         $listonly
         $LOGDIR
         $memanalyze
-        $memdump
+        $MEMDUMP
         $perl
         $PIDDIR
         $proxy_address
         $PROXYIN
         $pwd
         $run_event_based
-        $SERVER2IN
         $SERVERIN
         $srcdir
         $TESTDIR
@@ -62,12 +61,6 @@ BEGIN {
         %feature
         %keywords
         @protocols
-        %timesrvrend
-        %timesrvrini
-        %timesrvrlog
-        %timetoolend
-        %timetoolini
-        %timevrfyend
     );
 }
 use pathhelp qw(exe_ext);
@@ -92,16 +85,8 @@ our $CURLVERSION="";  # curl's reported version number
 our $pwd = getcwd();  # current working directory
 our $srcdir = $ENV{'srcdir'} || '.';  # root of the test source code
 our $perl="perl -I$srcdir"; # invoke perl like this
-our $LOGDIR="log";  # root of the log directory
-# TODO: $LOGDIR could eventually change later on, so must regenerate all the
-# paths depending on it after $LOGDIR itself changes.
-our $PIDDIR = "$LOGDIR/server";  # root of the server directory with PID files
-# TODO: change this to use server_inputfilename()
-our $SERVERIN="$LOGDIR/server.input";    # what curl sent the server
-our $SERVER2IN="$LOGDIR/server2.input";  # what curl sent the second server
-our $PROXYIN="$LOGDIR/proxy.input";      # what curl sent the proxy
-our $memdump="$LOGDIR/memdump";  # file that the memory debugging creates
-our $FTPDCMD="$LOGDIR/ftpserver.cmd";    # copy server instructions here
+our $LOGDIR="log";  # root of the log directory; this will be different for
+                    # each runner in multiprocess mode
 our $LIBDIR="./libtest";
 our $TESTDIR="$srcdir/data";
 our $CURL="../src/curl".exe_ext('TOOL'); # what curl binary to run on the tests
@@ -112,16 +97,17 @@ our $VCURL=$CURL;  # what curl binary to use to verify the servers with
 our $memanalyze="$perl $srcdir/memanalyze.pl";
 our $valgrind;     # path to valgrind, or empty if disabled
 
+# paths in $LOGDIR
+our $PIDDIR = "server";         # root of the server directory with PID files
+our $SERVERIN="server.input";   # what curl sent the server
+our $PROXYIN="proxy.input";     # what curl sent the proxy
+our $MEMDUMP="memdump";         # file that the memory debugging creates
+our $FTPDCMD="ftpserver.cmd";   # copy server instructions here
+
 # other config variables
 our @protocols;   # array of lowercase supported protocol servers
 our %feature;     # hash of enabled features
 our $has_shared;  # built as a shared library
 our %keywords;    # hash of keywords from the test spec
-our %timesrvrini; # timestamp for each test required servers verification start
-our %timesrvrend; # timestamp for each test required servers verification end
-our %timetoolini; # timestamp for each test command run starting
-our %timetoolend; # timestamp for each test command run stopping
-our %timesrvrlog; # timestamp for each test server logs lock removal
-our %timevrfyend; # timestamp for each test result verification end
 
 1;

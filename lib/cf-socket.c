@@ -212,6 +212,10 @@ tcpkeepalive(struct Curl_easy *data,
   }
 }
 
+/**
+ * Assign the address `ai` to the Curl_sockaddr_ex `dest` and
+ * set the transport used.
+ */
 void Curl_sock_assign_addr(struct Curl_sockaddr_ex *dest,
                            const struct Curl_addrinfo *ai,
                            int transport)
@@ -717,8 +721,11 @@ static bool verifyconnect(curl_socket_t sockfd, int *error)
   return rc;
 }
 
-CURLcode Curl_socket_connect_result(struct Curl_easy *data,
-                                    const char *ipaddress, int error)
+/**
+ * Determine the curl code for a socket connect() == -1 with errno.
+ */
+static CURLcode socket_connect_result(struct Curl_easy *data,
+                                      const char *ipaddress, int error)
 {
   char buffer[STRERROR_LEN];
 
@@ -747,7 +754,7 @@ CURLcode Curl_socket_connect_result(struct Curl_easy *data,
 }
 
 /* We have a recv buffer to enhance reads with len < NW_SMALL_READS.
- * This happens often on TLS connections where the TLS implemenation
+ * This happens often on TLS connections where the TLS implementation
  * tries to read the head of a TLS record, determine the length of the
  * full record and then make a subsequent read for that.
  * On large reads, we will not fill the buffer to avoid the double copy. */
@@ -864,7 +871,7 @@ static void cf_socket_close(struct Curl_cfilter *cf, struct Curl_easy *data)
       /* this is our local socket, we did never publish it */
       DEBUGF(LOG_CF(data, cf, "cf_socket_close(%" CURL_FORMAT_SOCKET_T
                     ", not active)", ctx->sock));
-      sclose(ctx->sock);
+      socket_close(data, cf->conn, !ctx->accepted, ctx->sock);
       ctx->sock = CURL_SOCKET_BAD;
     }
     Curl_bufq_reset(&ctx->recvbuf);
@@ -894,22 +901,26 @@ static CURLcode set_local_ip(struct Curl_cfilter *cf,
   struct cf_socket_ctx *ctx = cf->ctx;
 
 #ifdef HAVE_GETSOCKNAME
-  char buffer[STRERROR_LEN];
-  struct Curl_sockaddr_storage ssloc;
-  curl_socklen_t slen = sizeof(struct Curl_sockaddr_storage);
+  if(!(data->conn->handler->protocol & CURLPROTO_TFTP)) {
+    /* TFTP does not connect, so it cannot get the IP like this */
 
-  memset(&ssloc, 0, sizeof(ssloc));
-  if(getsockname(ctx->sock, (struct sockaddr*) &ssloc, &slen)) {
-    int error = SOCKERRNO;
-    failf(data, "getsockname() failed with errno %d: %s",
-          error, Curl_strerror(error, buffer, sizeof(buffer)));
-    return CURLE_FAILED_INIT;
-  }
-  if(!Curl_addr2string((struct sockaddr*)&ssloc, slen,
-                       ctx->l_ip, &ctx->l_port)) {
-    failf(data, "ssloc inet_ntop() failed with errno %d: %s",
-          errno, Curl_strerror(errno, buffer, sizeof(buffer)));
-    return CURLE_FAILED_INIT;
+    char buffer[STRERROR_LEN];
+    struct Curl_sockaddr_storage ssloc;
+    curl_socklen_t slen = sizeof(struct Curl_sockaddr_storage);
+
+    memset(&ssloc, 0, sizeof(ssloc));
+    if(getsockname(ctx->sock, (struct sockaddr*) &ssloc, &slen)) {
+      int error = SOCKERRNO;
+      failf(data, "getsockname() failed with errno %d: %s",
+            error, Curl_strerror(error, buffer, sizeof(buffer)));
+      return CURLE_FAILED_INIT;
+    }
+    if(!Curl_addr2string((struct sockaddr*)&ssloc, slen,
+                         ctx->l_ip, &ctx->l_port)) {
+      failf(data, "ssloc inet_ntop() failed with errno %d: %s",
+            errno, Curl_strerror(errno, buffer, sizeof(buffer)));
+      return CURLE_FAILED_INIT;
+    }
   }
 #else
   (void)data;
@@ -1128,7 +1139,7 @@ static CURLcode cf_tcp_connect(struct Curl_cfilter *cf,
     /* Connect TCP socket */
     rc = do_connect(cf, data, cf->conn->bits.tcp_fastopen);
     if(-1 == rc) {
-      result = Curl_socket_connect_result(data, ctx->r_ip, SOCKERRNO);
+      result = socket_connect_result(data, ctx->r_ip, SOCKERRNO);
       goto out;
     }
   }
@@ -1234,20 +1245,6 @@ static ssize_t cf_socket_send(struct Curl_cfilter *cf, struct Curl_easy *data,
   struct cf_socket_ctx *ctx = cf->ctx;
   curl_socket_t fdsave;
   ssize_t nwritten;
-
-#ifdef USE_RECV_BEFORE_SEND_WORKAROUND
-  /* WinSock will destroy unread received data if send() is
-     failed.
-     To avoid lossage of received data, recv() must be
-     performed before every send() if any incoming data is
-     available. */
-  if(ctx->buffer_recv && !Curl_bufq_is_full(&ctx->recvbuf)) {
-    nwritten = Curl_bufq_slurp(&ctx->recvbuf, nw_in_read, &rctx, err);
-    if(nwritten < 0 && *err != CURLE_AGAIN) {
-      return -1;
-    }
-  }
-#endif
 
   *err = CURLE_OK;
   fdsave = cf->conn->sock[cf->sockindex];
@@ -1363,26 +1360,31 @@ out:
 static void conn_set_primary_ip(struct Curl_cfilter *cf,
                                 struct Curl_easy *data)
 {
-  struct cf_socket_ctx *ctx = cf->ctx;
 #ifdef HAVE_GETPEERNAME
-  char buffer[STRERROR_LEN];
-  struct Curl_sockaddr_storage ssrem;
-  curl_socklen_t plen;
-  int port;
+  struct cf_socket_ctx *ctx = cf->ctx;
+  if(!(data->conn->handler->protocol & CURLPROTO_TFTP)) {
+    /* TFTP does not connect the endpoint: getpeername() failed with errno
+       107: Transport endpoint is not connected */
 
-  plen = sizeof(ssrem);
-  memset(&ssrem, 0, plen);
-  if(getpeername(ctx->sock, (struct sockaddr*) &ssrem, &plen)) {
-    int error = SOCKERRNO;
-    failf(data, "getpeername() failed with errno %d: %s",
-          error, Curl_strerror(error, buffer, sizeof(buffer)));
-    return;
-  }
-  if(!Curl_addr2string((struct sockaddr*)&ssrem, plen,
-                       cf->conn->primary_ip, &port)) {
-    failf(data, "ssrem inet_ntop() failed with errno %d: %s",
-          errno, Curl_strerror(errno, buffer, sizeof(buffer)));
-    return;
+    char buffer[STRERROR_LEN];
+    struct Curl_sockaddr_storage ssrem;
+    curl_socklen_t plen;
+    int port;
+
+    plen = sizeof(ssrem);
+    memset(&ssrem, 0, plen);
+    if(getpeername(ctx->sock, (struct sockaddr*) &ssrem, &plen)) {
+      int error = SOCKERRNO;
+      failf(data, "getpeername() failed with errno %d: %s",
+            error, Curl_strerror(error, buffer, sizeof(buffer)));
+      return;
+    }
+    if(!Curl_addr2string((struct sockaddr*)&ssrem, plen,
+                         cf->conn->primary_ip, &port)) {
+      failf(data, "ssrem inet_ntop() failed with errno %d: %s",
+            errno, Curl_strerror(errno, buffer, sizeof(buffer)));
+      return;
+    }
   }
 #else
   cf->conn->primary_ip[0] = 0;
@@ -1405,20 +1407,11 @@ static void cf_socket_active(struct Curl_cfilter *cf, struct Curl_easy *data)
     conn_set_primary_ip(cf, data);
     set_local_ip(cf, data);
     Curl_persistconninfo(data, cf->conn, ctx->l_ip, ctx->l_port);
-    /* We buffer only for TCP transfers that do not install their own read
-     * function. Those may still have expectations about socket behaviours from
-     * the past.
-     *
-     * Note buffering is currently disabled by default because we have stalls
+    /* buffering is currently disabled by default because we have stalls
      * in parallel transfers where not all buffered data is consumed and no
      * socket events happen.
      */
-#ifdef USE_RECV_BEFORE_SEND_WORKAROUND
-    ctx->buffer_recv = (ctx->transport == TRNSPRT_TCP &&
-                        (cf->conn->recv[cf->sockindex] == Curl_conn_recv));
-#else
     ctx->buffer_recv = FALSE;
-#endif
   }
   ctx->active = TRUE;
 }
@@ -1585,7 +1578,7 @@ static CURLcode cf_udp_setup_quic(struct Curl_cfilter *cf,
 
   rc = connect(ctx->sock, &ctx->addr.sa_addr, ctx->addr.addrlen);
   if(-1 == rc) {
-    return Curl_socket_connect_result(data, ctx->r_ip, SOCKERRNO);
+    return socket_connect_result(data, ctx->r_ip, SOCKERRNO);
   }
   set_local_ip(cf, data);
   DEBUGF(LOG_CF(data, cf, "%s socket %" CURL_FORMAT_SOCKET_T
@@ -1889,7 +1882,10 @@ CURLcode Curl_conn_tcp_accepted_set(struct Curl_easy *data,
   return CURLE_OK;
 }
 
-bool Curl_cf_is_socket(struct Curl_cfilter *cf)
+/**
+ * Return TRUE iff `cf` is a socket filter.
+ */
+static bool cf_is_socket(struct Curl_cfilter *cf)
 {
   return cf && (cf->cft == &Curl_cft_tcp ||
                 cf->cft == &Curl_cft_udp ||
@@ -1904,7 +1900,7 @@ CURLcode Curl_cf_socket_peek(struct Curl_cfilter *cf,
                              const char **pr_ip_str, int *pr_port,
                              const char **pl_ip_str, int *pl_port)
 {
-  if(Curl_cf_is_socket(cf) && cf->ctx) {
+  if(cf_is_socket(cf) && cf->ctx) {
     struct cf_socket_ctx *ctx = cf->ctx;
 
     if(psock)

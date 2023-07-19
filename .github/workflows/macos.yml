@@ -41,6 +41,7 @@ permissions: {}
 
 env:
   DEVELOPER_DIR: /Applications/Xcode_14.0.1.app/Contents/Developer
+  MAKEFLAGS: -j 5
 
 jobs:
   autotools:
@@ -83,6 +84,9 @@ jobs:
           install: nghttp2
           configure: --enable-debug --with-secure-transport
           macosx-version-min: 10.8
+        - name: gcc SecureTransport
+          configure: CC=gcc-12 --enable-debug --with-secure-transport
+          macosx-version-min: 10.8
         - name: OpenSSL http2
           install: nghttp2 openssl
           configure: --enable-debug --with-openssl=/usr/local/opt/openssl
@@ -114,6 +118,17 @@ jobs:
     # https://github.com/curl/curl/runs/4095721123?check_suite_focus=true
     - run: "while [[ $? == 0 ]]; do for i in 1 2 3; do brew update && brew bundle install --no-lock --file /tmp/Brewfile && break 2 || { echo Error: wait to try again; sleep 10; } done; false Too many retries; done"
       name: 'brew install'
+
+    - run: |
+        case "${{ matrix.build.install }}" in
+          *openssl*)
+            ;;
+          *)
+            if test -d /usr/local/include/openssl; then
+              brew unlink openssl
+            fi;;
+        esac
+      name: 'brew unlink openssl'
 
     - run: python3 -m pip install impacket
       name: 'pip3 install'
@@ -162,7 +177,7 @@ jobs:
           generate: -DOPENSSL_ROOT_DIR=/usr/local/opt/openssl -DCURL_DISABLE_LDAP=ON -DCURL_DISABLE_LDAPS=ON
         - name: LibreSSL
           install: nghttp2 libressl
-          generate: -DOPENSSL_ROOT_DIR=/usr/local/opt/libressl -DCURL_DISABLE_LDAP=ON -DCURL_DISABLE_LDAPS=ON
+          generate: -DOPENSSL_ROOT_DIR=/usr/local/opt/libressl -DCURL_DISABLE_LDAP=ON -DCURL_DISABLE_LDAPS=ON -DCMAKE_UNITY_BUILD=ON
         - name: libssh2
           install: nghttp2 openssl libssh2
           generate: -DOPENSSL_ROOT_DIR=/usr/local/opt/openssl -DCURL_USE_LIBSSH2=ON
@@ -173,8 +188,16 @@ jobs:
     - run: "while [[ $? == 0 ]]; do for i in 1 2 3; do brew update && brew bundle install --no-lock --file /tmp/Brewfile && break 2 || { echo Error: wait to try again; sleep 10; } done; false Too many retries; done"
       name: 'brew install'
 
-    - run: python3 -m pip install impacket
-      name: 'pip3 install'
+    - run: |
+        case "${{ matrix.build.install }}" in
+          *openssl*)
+            ;;
+          *)
+            if test -d /usr/local/include/openssl; then
+              brew unlink openssl
+            fi;;
+        esac
+      name: 'brew unlink openssl'
 
     - uses: actions/checkout@v3
 

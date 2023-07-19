@@ -61,14 +61,11 @@
 #include "doh.h"
 #include "warnless.h"
 #include "strcase.h"
+#include "easy_lock.h"
 /* The last 3 #include files should be in this order */
 #include "curl_printf.h"
 #include "curl_memory.h"
 #include "memdebug.h"
-
-#if defined(ENABLE_IPV6) && defined(CURL_OSX_CALL_COPYPROXIES)
-#include <SystemConfiguration/SCDynamicStoreCopySpecific.h>
-#endif
 
 #if defined(CURLRES_SYNCH) &&                   \
   defined(HAVE_ALARM) &&                        \
@@ -77,10 +74,6 @@
   defined(GLOBAL_INIT_IS_THREADSAFE)
 /* alarm-based timeouts can only be used with all the dependencies satisfied */
 #define USE_ALARM_TIMEOUT
-#endif
-
-#ifdef USE_ALARM_TIMEOUT
-#include "easy_lock.h"
 #endif
 
 #define MAX_HOSTCACHE_LEN (255 + 7) /* max FQDN + colon + port number + zero */
@@ -131,7 +124,7 @@ static void freednsentry(void *freethis);
 /*
  * Return # of addresses in a Curl_addrinfo struct
  */
-int Curl_num_addresses(const struct Curl_addrinfo *addr)
+static int num_addresses(const struct Curl_addrinfo *addr)
 {
   int i = 0;
   while(addr) {
@@ -289,8 +282,8 @@ void Curl_hostcache_prune(struct Curl_easy *data)
 /* Beware this is a global and unique instance. This is used to store the
    return address that we can jump back to from inside a signal handler. This
    is not thread-safe stuff. */
-sigjmp_buf curl_jmpenv;
-curl_simple_lock curl_jmpenv_lock;
+static sigjmp_buf curl_jmpenv;
+static curl_simple_lock curl_jmpenv_lock;
 #endif
 
 /* lookup address, returns entry if found and not stale */
@@ -413,7 +406,7 @@ UNITTEST CURLcode Curl_shuffle_addr(struct Curl_easy *data,
                                     struct Curl_addrinfo **addr)
 {
   CURLcode result = CURLE_OK;
-  const int num_addrs = Curl_num_addresses(*addr);
+  const int num_addrs = num_addresses(*addr);
 
   if(num_addrs > 1) {
     struct Curl_addrinfo **nodes;
@@ -745,23 +738,6 @@ enum resolve_t Curl_resolv(struct Curl_easy *data,
       if(st)
         return CURLRESOLV_ERROR;
     }
-
-#if defined(ENABLE_IPV6) && defined(CURL_OSX_CALL_COPYPROXIES)
-    {
-      /*
-       * The automagic conversion from IPv4 literals to IPv6 literals only
-       * works if the SCDynamicStoreCopyProxies system function gets called
-       * first. As Curl currently doesn't support system-wide HTTP proxies, we
-       * therefore don't use any value this function might return.
-       *
-       * This function is only available on a macOS and is not needed for
-       * IPv4-only builds, hence the conditions above.
-       */
-      CFDictionaryRef dict = SCDynamicStoreCopyProxies(NULL);
-      if(dict)
-        CFRelease(dict);
-    }
-#endif
 
 #ifndef USE_RESOLVE_ON_IPS
     /* First check if this is an IPv4 address string */
@@ -1240,7 +1216,7 @@ CURLcode Curl_loadhostpairs(struct Curl_easy *data)
         goto err;
 
       error = false;
-   err:
+err:
       if(error) {
         failf(data, "Couldn't parse CURLOPT_RESOLVE entry '%s'",
               hostp->data);

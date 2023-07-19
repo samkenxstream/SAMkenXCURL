@@ -188,9 +188,10 @@ struct stream_ctx {
   int64_t id; /* HTTP/3 protocol stream identifier */
   struct bufq recvbuf; /* h3 response */
   uint64_t error3; /* HTTP/3 stream error code */
+  curl_off_t upload_left; /* number of request bytes left to upload */
   bool closed; /* TRUE on stream close */
   bool reset;  /* TRUE on stream reset */
-  bool upload_done; /* stream is locally closed */
+  bool send_closed; /* stream is locally closed */
   bool resp_hds_complete;  /* complete, final response has been received */
   bool resp_got_header; /* TRUE when h3 stream has recvd some HEADER */
 };
@@ -276,7 +277,7 @@ static CURLcode h3_data_setup(struct Curl_cfilter *cf,
   stream->id = -1;
   Curl_bufq_initp(&stream->recvbuf, &ctx->stream_bufcp,
                   H3_STREAM_RECV_CHUNKS, BUFQ_OPT_SOFT_LIMIT);
-  DEBUGF(LOG_CF(data, cf, "data setup (easy %p)", (void *)data));
+  DEBUGF(LOG_CF(data, cf, "data setup"));
   return CURLE_OK;
 }
 
@@ -307,7 +308,7 @@ static void drain_stream(struct Curl_cfilter *cf,
 
   (void)cf;
   bits = CURL_CSELECT_IN;
-  if(stream && !stream->upload_done)
+  if(stream && !stream->send_closed && stream->upload_left)
     bits |= CURL_CSELECT_OUT;
   if(data->state.dselect_bits != bits) {
     data->state.dselect_bits = bits;
@@ -424,10 +425,6 @@ static ssize_t stream_resp_read(void *reader_ctx,
     *err = CURLE_OK;
     return nread;
   }
-  else if(nread < 0) {
-    *err = CURLE_AGAIN;
-    return -1;
-  }
   else {
     *err = stream->resp_got_header? CURLE_PARTIAL_FILE : CURLE_RECV_ERROR;
     return -1;
@@ -464,6 +461,7 @@ static CURLcode cf_recv_body(struct Curl_cfilter *cf,
           nwritten, stream->id);
     stream->closed = TRUE;
     stream->reset = TRUE;
+    stream->send_closed = TRUE;
     streamclose(cf->conn, "Reset of stream");
     return result;
   }
@@ -529,6 +527,7 @@ static CURLcode h3_process_event(struct Curl_cfilter *cf,
     DEBUGF(LOG_CF(data, cf, "[h3sid=%"PRId64"][RESET]", stream3_id));
     stream->closed = TRUE;
     stream->reset = TRUE;
+    stream->send_closed = TRUE;
     streamclose(cf->conn, "Reset of stream");
     break;
 
@@ -646,7 +645,7 @@ static CURLcode recv_pkt(const unsigned char *pkt, size_t pktlen,
     }
   }
   else if((size_t)nread < pktlen) {
-    DEBUGF(LOG_CF(r->data, r->cf, "ingress, quiche only read %zd/%zd bytes",
+    DEBUGF(LOG_CF(r->data, r->cf, "ingress, quiche only read %zd/%zu bytes",
                   nread, pktlen));
   }
 
@@ -823,7 +822,7 @@ static ssize_t cf_quiche_recv(struct Curl_cfilter *cf, struct Curl_easy *data,
 
   if(!stream) {
     *err = CURLE_RECV_ERROR;
-    goto out;
+    return -1;
   }
 
   if(!Curl_bufq_is_empty(&stream->recvbuf)) {
@@ -880,8 +879,10 @@ out:
   }
   if(nread > 0)
     ctx->data_recvd += nread;
-  DEBUGF(LOG_CF(data, cf, "[h3sid=%"PRId64"] cf_recv(total=%zd) -> %zd, %d",
-                stream->id, ctx->data_recvd, nread, *err));
+  DEBUGF(LOG_CF(data, cf, "[h3sid=%"PRId64"] cf_recv(total=%"
+                CURL_FORMAT_CURL_OFF_T ") -> %zd, %d",
+                stream ? stream->id : (int64_t)0,
+                ctx->data_recvd, nread, *err));
   return nread;
 }
 
@@ -906,14 +907,13 @@ static ssize_t h3_open_stream(struct Curl_cfilter *cf,
   if(!stream) {
     *err = h3_data_setup(cf, data);
     if(*err) {
-      nwritten = -1;
-      goto out;
+      return -1;
     }
     stream = H3_STREAM_CTX(data);
     DEBUGASSERT(stream);
   }
 
-  Curl_h1_req_parse_init(&h1, (4*1024));
+  Curl_h1_req_parse_init(&h1, H1_PARSE_DEFAULT_MAX_LINE_LEN);
   Curl_dynhds_init(&h2_headers, 0, DYN_HTTP_REQUEST);
 
   DEBUGASSERT(stream);
@@ -951,18 +951,21 @@ static ssize_t h3_open_stream(struct Curl_cfilter *cf,
   case HTTPREQ_POST_MIME:
   case HTTPREQ_PUT:
     if(data->state.infilesize != -1)
-      stream->upload_done = !data->state.infilesize;
+      stream->upload_left = data->state.infilesize;
     else
       /* data sending without specifying the data amount up front */
-      stream->upload_done = FALSE;
+      stream->upload_left = -1; /* unknown */
     break;
   default:
-    stream->upload_done = TRUE;
+    stream->upload_left = 0; /* no request body */
     break;
   }
 
+  if(stream->upload_left == 0)
+    stream->send_closed = TRUE;
+
   stream3_id = quiche_h3_send_request(ctx->h3c, ctx->qconn, nva, nheader,
-                                      stream->upload_done);
+                                      stream->send_closed);
   if(stream3_id < 0) {
     if(QUICHE_H3_ERR_STREAM_BLOCKED == stream3_id) {
       /* quiche seems to report this error if the connection window is
@@ -989,8 +992,7 @@ static ssize_t h3_open_stream(struct Curl_cfilter *cf,
   stream->closed = FALSE;
   stream->reset = FALSE;
 
-  infof(data, "Using HTTP/3 Stream ID: %" PRId64 " (easy handle %p)",
-        stream3_id, (void *)data);
+  infof(data, "Using HTTP/3 Stream ID: %" PRId64, stream3_id);
   DEBUGF(LOG_CF(data, cf, "[h3sid=%" PRId64 "] opened for %s",
                 stream3_id, data->state.url));
 
@@ -1022,11 +1024,10 @@ static ssize_t cf_quiche_send(struct Curl_cfilter *cf, struct Curl_easy *data,
     stream = H3_STREAM_CTX(data);
   }
   else {
+    bool eof = (stream->upload_left >= 0 &&
+                (curl_off_t)len >= stream->upload_left);
     nwritten = quiche_h3_send_body(ctx->h3c, ctx->qconn, stream->id,
-                                   (uint8_t *)buf, len, stream->upload_done);
-    DEBUGF(LOG_CF(data, cf, "[h3sid=%" PRId64 "] send body(len=%zu, eof=%d) "
-                  "-> %zd", stream->id, len, stream->upload_done,
-                  nwritten));
+                                   (uint8_t *)buf, len, eof);
     if(nwritten == QUICHE_H3_ERR_DONE || (nwritten == 0 && len > 0)) {
       /* TODO: we seem to be blocked on flow control and should HOLD
        * sending. But when do we open again? */
@@ -1055,6 +1056,16 @@ static ssize_t cf_quiche_send(struct Curl_cfilter *cf, struct Curl_easy *data,
     }
     else {
       /* quiche accepted all or at least a part of the buf */
+      if(stream->upload_left > 0) {
+        stream->upload_left = (nwritten < stream->upload_left)?
+                              (stream->upload_left - nwritten) : 0;
+      }
+      if(stream->upload_left == 0)
+        stream->send_closed = TRUE;
+
+      DEBUGF(LOG_CF(data, cf, "[h3sid=%" PRId64 "] send body(len=%zu, "
+                              "left=%" CURL_FORMAT_CURL_OFF_T ") -> %zd",
+                    stream->id, len, stream->upload_left, nwritten));
       *err = CURLE_OK;
     }
   }
@@ -1149,11 +1160,12 @@ static CURLcode cf_quiche_data_event(struct Curl_cfilter *cf,
   }
   case CF_CTRL_DATA_DONE_SEND: {
     struct stream_ctx *stream = H3_STREAM_CTX(data);
-    if(stream) {
+    if(stream && !stream->send_closed) {
       unsigned char body[1];
       ssize_t sent;
-      stream->upload_done = TRUE;
 
+      stream->send_closed = TRUE;
+      stream->upload_left = 0;
       body[0] = 'X';
       sent = cf_quiche_send(cf, data, body, 0, &result);
       DEBUGF(LOG_CF(data, cf, "[h3sid=%"PRId64"] DONE_SEND -> %zd, %d",
@@ -1539,13 +1551,11 @@ static bool cf_quiche_conn_is_alive(struct Curl_cfilter *cf,
        not in use by any other transfer, there shouldn't be any data here,
        only "protocol frames" */
     *input_pending = FALSE;
-    Curl_attach_connection(data, cf->conn);
     if(cf_process_ingress(cf, data))
       alive = FALSE;
     else {
       alive = TRUE;
     }
-    Curl_detach_connection(data);
   }
 
   return alive;

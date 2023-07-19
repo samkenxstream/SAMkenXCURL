@@ -69,6 +69,12 @@ add_library(
   ALIAS ${LIB_NAME}
   )
 
+if(ENABLE_CURLDEBUG)
+  # We must compile memdebug.c separately to avoid memdebug.h redefinitions
+  # being applied to memdebug.c itself.
+  set_source_files_properties(memdebug.c PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+endif()
+
 if(NOT BUILD_SHARED_LIBS)
     set_target_properties(${LIB_NAME} PROPERTIES INTERFACE_COMPILE_DEFINITIONS CURL_STATICLIB)
 endif()
@@ -131,8 +137,8 @@ if(WIN32)
       set_target_properties(${LIB_NAME} PROPERTIES IMPORT_SUFFIX "_imp.lib")
     endif()
   endif()
-else()
-  # on not-Windows, check for writable argv[]
+elseif(NOT CMAKE_CROSSCOMPILING)
+  # on not-Windows and not-crosscompiling, check for writable argv[]
     include(CheckCSourceRuns)
     check_c_source_runs("
 int main(int argc, char **argv)

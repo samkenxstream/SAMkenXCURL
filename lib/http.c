@@ -398,7 +398,7 @@ static CURLcode http_output_basic(struct Curl_easy *data, bool proxy)
     goto fail;
   }
 
-  fail:
+fail:
   free(out);
   return result;
 }
@@ -424,7 +424,7 @@ static CURLcode http_output_bearer(struct Curl_easy *data)
     goto fail;
   }
 
-  fail:
+fail:
   return result;
 }
 
@@ -2667,11 +2667,7 @@ CURLcode Curl_http_bodysend(struct Curl_easy *data, struct connectdata *conn,
 #ifndef USE_HYPER
     /* With Hyper the body is always passed on separately */
     if(data->set.postfields) {
-
-      /* In HTTP2, we send request body in DATA frame regardless of
-         its size. */
-      if(conn->httpversion < 20 &&
-         !data->state.expect100header &&
+      if(!data->state.expect100header &&
          (http->postsize < MAX_INITIAL_POST_SIZE)) {
         /* if we don't use expect: 100  AND
            postsize is less than MAX_INITIAL_POST_SIZE
@@ -2832,16 +2828,18 @@ CURLcode Curl_http_cookies(struct Curl_easy *data,
     }
     if(co) {
       struct Cookie *store = co;
+      size_t clen = 8; /* hold the size of the generated Cookie: header */
       /* now loop through all cookies that matched */
       while(co) {
         if(co->value) {
-          if(0 == count) {
+          size_t add;
+          if(!count) {
             result = Curl_dyn_addn(r, STRCONST("Cookie: "));
             if(result)
               break;
           }
-          if((Curl_dyn_len(r) + strlen(co->name) + strlen(co->value) + 1) >=
-             MAX_COOKIE_HEADER_LEN) {
+          add = strlen(co->name) + strlen(co->value) + 1;
+          if(clen + add >= MAX_COOKIE_HEADER_LEN) {
             infof(data, "Restricted outgoing cookies due to header size, "
                   "'%s' not sent", co->name);
             linecap = TRUE;
@@ -2851,6 +2849,7 @@ CURLcode Curl_http_cookies(struct Curl_easy *data,
                                  co->name, co->value);
           if(result)
             break;
+          clen += add + (count ? 2 : 0);
           count++;
         }
         co = co->next; /* next cookie please */
@@ -4537,13 +4536,13 @@ static char *my_strndup(const char *ptr, size_t len)
   return copy;
 }
 
-CURLcode Curl_http_req_make(struct http_req **preq,
+CURLcode Curl_http_req_make(struct httpreq **preq,
                             const char *method, size_t m_len,
                             const char *scheme, size_t s_len,
                             const char *authority, size_t a_len,
                             const char *path, size_t p_len)
 {
-  struct http_req *req;
+  struct httpreq *req;
   CURLcode result = CURLE_OUT_OF_MEMORY;
 
   DEBUGASSERT(method);
@@ -4580,7 +4579,7 @@ out:
   return result;
 }
 
-static CURLcode req_assign_url_authority(struct http_req *req, CURLU *url)
+static CURLcode req_assign_url_authority(struct httpreq *req, CURLU *url)
 {
   char *user, *pass, *host, *port;
   struct dynbuf buf;
@@ -4646,7 +4645,7 @@ out:
   return result;
 }
 
-static CURLcode req_assign_url_path(struct http_req *req, CURLU *url)
+static CURLcode req_assign_url_path(struct httpreq *req, CURLU *url)
 {
   char *path, *query;
   struct dynbuf buf;
@@ -4694,11 +4693,11 @@ out:
   return result;
 }
 
-CURLcode Curl_http_req_make2(struct http_req **preq,
+CURLcode Curl_http_req_make2(struct httpreq **preq,
                              const char *method, size_t m_len,
                              CURLU *url, const char *scheme_default)
 {
-  struct http_req *req;
+  struct httpreq *req;
   CURLcode result = CURLE_OUT_OF_MEMORY;
   CURLUcode uc;
 
@@ -4738,7 +4737,7 @@ out:
   return result;
 }
 
-void Curl_http_req_free(struct http_req *req)
+void Curl_http_req_free(struct httpreq *req)
 {
   if(req) {
     free(req->scheme);
@@ -4778,7 +4777,7 @@ static bool h2_non_field(const char *name, size_t namelen)
 }
 
 CURLcode Curl_http_req_to_h2(struct dynhds *h2_headers,
-                             struct http_req *req, struct Curl_easy *data)
+                             struct httpreq *req, struct Curl_easy *data)
 {
   const char *scheme = NULL, *authority = NULL;
   struct dynhds_entry *e;

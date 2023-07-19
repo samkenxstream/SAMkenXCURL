@@ -71,6 +71,7 @@ static CURLcode cf_haproxy_date_out_set(struct Curl_cfilter*cf,
   struct cf_haproxy_ctx *ctx = cf->ctx;
   CURLcode result;
   const char *tcp_version;
+  const char *client_ip;
 
   DEBUGASSERT(ctx);
   DEBUGASSERT(ctx->state == HAPROXY_INIT);
@@ -82,11 +83,15 @@ static CURLcode cf_haproxy_date_out_set(struct Curl_cfilter*cf,
 #endif /* USE_UNIX_SOCKETS */
   /* Emit the correct prefix for IPv6 */
   tcp_version = cf->conn->bits.ipv6 ? "TCP6" : "TCP4";
+  if(data->set.str[STRING_HAPROXY_CLIENT_IP])
+    client_ip = data->set.str[STRING_HAPROXY_CLIENT_IP];
+  else
+    client_ip = data->info.conn_primary_ip;
 
   result = Curl_dyn_addf(&ctx->data_out, "PROXY %s %s %s %i %i\r\n",
                          tcp_version,
                          data->info.conn_local_ip,
-                         data->info.conn_primary_ip,
+                         client_ip,
                          data->info.conn_local_port,
                          data->info.conn_primary_port);
 
@@ -225,22 +230,6 @@ static CURLcode cf_haproxy_create(struct Curl_cfilter **pcf,
 out:
   cf_haproxy_ctx_free(ctx);
   *pcf = result? NULL : cf;
-  return result;
-}
-
-CURLcode Curl_conn_haproxy_add(struct Curl_easy *data,
-                               struct connectdata *conn,
-                               int sockindex)
-{
-  struct Curl_cfilter *cf;
-  CURLcode result;
-
-  result = cf_haproxy_create(&cf, data);
-  if(result)
-    goto out;
-  Curl_conn_cf_add(data, conn, sockindex, cf);
-
-out:
   return result;
 }
 
